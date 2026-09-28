@@ -1,0 +1,7 @@
+## Interface: 16001
+## Title: Resist Forever
+## Notes: Adds partial-resist chances and spell miss to character panel resistance tooltips.
+## Author: BabuniGaming
+## Version: 1.0.0
+
+ResistForever.lua
