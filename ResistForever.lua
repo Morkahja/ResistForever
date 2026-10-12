@@ -32,18 +32,30 @@ for _, school in ipairs(SCHOOLS) do
 end
 
 -- PaperDollFrameStats.lua CharacterHitFrame_OnEnter declares
--- spellMissChances = { 4, 5, 6, 17 } and does not apply the table.
--- Index is how many levels the target is above the caster.
-local VERIFIED_SPELL_MISS = {
+-- spellMissChances = { 4, 5, 6, 17 } (PvE, levels 0-3 above the caster).
+-- Blizzard's classic tables also split player targets (PvP) from mobs (PvE):
+--   PvE +3 = 17%, then +11% per further level
+--   PvP +3 = 13%, then +7% per further level
+-- Index is how many levels the defender is above the caster.
+local SPELL_MISS_PVE = {
     [0] = 0.04,
     [1] = 0.05,
     [2] = 0.06,
     [3] = 0.17,
 }
+local SPELL_MISS_PVP = {
+    [0] = 0.04,
+    [1] = 0.05,
+    [2] = 0.06,
+    [3] = 0.13,
+}
 
 local cache = {
-    playerLevel = nil,
-    resistance = {},
+    level = {},
+    resistance = {
+        player = {},
+        pet = {},
+    },
 }
 
 local openRow
@@ -168,39 +180,40 @@ local function ComputePartialResistBuckets(resistance, attackerLevel)
     return buckets
 end
 
--- Miss chance for a caster of attackerLevel against a target of playerLevel.
--- 0/1/2/3 levels above the caster are the client table. Everything else is
--- the classic PvE continuation and is an assumption:
---   further levels above the caster: +11% each
---   caster above the target: -1% each
---   a 1% miss is kept, because the client table never states a floor
-local function ComputeSpellMiss(playerLevel, attackerLevel)
-    if not playerLevel or not attackerLevel or playerLevel < 1 or attackerLevel < 1 then
+-- Miss chance for a caster of attackerLevel against a defender of defenderLevel.
+-- Player defenders use the PvP column; pets and other non-players use PvE.
+-- Below the caster, classic tables fall 1% per level to 0% at -4 and lower.
+-- Above +3, continuation is the classic +11% (PvE) / +7% (PvP) per level.
+local function ComputeSpellMiss(defenderLevel, attackerLevel, defenderIsPlayer)
+    if not defenderLevel or not attackerLevel or defenderLevel < 1 or attackerLevel < 1 then
         return nil
     end
-    local levelsAboveCaster = playerLevel - attackerLevel
-    local verified = VERIFIED_SPELL_MISS[levelsAboveCaster]
+    local levelsAboveCaster = defenderLevel - attackerLevel
+    local table = defenderIsPlayer and SPELL_MISS_PVP or SPELL_MISS_PVE
+    local verified = table[levelsAboveCaster]
     if verified then
         return verified
     end
 
     local miss
     if levelsAboveCaster > 3 then
-        miss = 0.17 + (levelsAboveCaster - 3) * 0.11
+        local base = defenderIsPlayer and 0.13 or 0.17
+        local step = defenderIsPlayer and 0.07 or 0.11
+        miss = base + (levelsAboveCaster - 3) * step
     else
         miss = 0.04 + levelsAboveCaster * 0.01
     end
-    if miss < 0.01 then
-        miss = 0.01
+    if miss < 0 then
+        miss = 0
     elseif miss > 1 then
         miss = 1
     end
     return miss
 end
 
-local function BuildResistanceContext(resistance, playerLevel, attackerLevel)
+local function BuildResistanceContext(resistance, defenderLevel, attackerLevel, defenderIsPlayer)
     local context = {
-        spellMiss = ComputeSpellMiss(playerLevel, attackerLevel),
+        spellMiss = ComputeSpellMiss(defenderLevel, attackerLevel, defenderIsPlayer),
     }
     if UsableNumber(resistance) and resistance > 0 then
         context.buckets = ComputePartialResistBuckets(resistance, attackerLevel)
@@ -218,11 +231,11 @@ end
 -- (realResistance) into the row text and into ExpectedSpellResistance.
 -- A readable row value is the number this tooltip already described, so it wins.
 -- A direct read prefers effectiveResistance, then realResistance.
-local function GetPlayerResistance(schoolID)
-    if not UnitResistance or not schoolID then
+local function GetUnitResistance(unit, schoolID)
+    if not UnitResistance or not unit or not schoolID then
         return nil
     end
-    local ok, _, realResistance, effectiveResistance = pcall(UnitResistance, "player", schoolID)
+    local ok, _, realResistance, effectiveResistance = pcall(UnitResistance, unit, schoolID)
     if not ok then
         return nil
     end
@@ -235,40 +248,45 @@ local function GetPlayerResistance(schoolID)
     return nil
 end
 
-local function GetPlayerLevel()
-    if not UnitLevel then
+local function GetUnitLevel(unit)
+    if not UnitLevel or not unit then
         return nil
     end
-    local ok, level = pcall(UnitLevel, "player")
+    local ok, level = pcall(UnitLevel, unit)
     if not ok then
         return nil
     end
     return WholeLevel(level)
 end
 
-local function ResolvePlayerLevel()
-    local live = GetPlayerLevel()
+local function ResolveUnitLevel(unit)
+    local live = GetUnitLevel(unit)
     if live then
-        cache.playerLevel = live
+        cache.level[unit] = live
         return live, false
     end
-    if cache.playerLevel then
-        return cache.playerLevel, true
+    if cache.level[unit] then
+        return cache.level[unit], true
     end
     return nil, false
 end
 
-local function ResolveResistance(schoolID, frame)
+local function ResolveResistance(unit, schoolID, frame)
+    local unitCache = cache.resistance[unit]
+    if not unitCache then
+        unitCache = {}
+        cache.resistance[unit] = unitCache
+    end
     if frame and UsableNumber(frame.numericValue) then
-        cache.resistance[schoolID] = frame.numericValue
+        unitCache[schoolID] = frame.numericValue
         return frame.numericValue, false
     end
-    local live = GetPlayerResistance(schoolID)
+    local live = GetUnitResistance(unit, schoolID)
     if live ~= nil then
-        cache.resistance[schoolID] = live
+        unitCache[schoolID] = live
         return live, false
     end
-    local saved = cache.resistance[schoolID]
+    local saved = unitCache[schoolID]
     if saved ~= nil then
         return saved, true
     end
@@ -278,7 +296,7 @@ end
 -- Target level is the assumed attacker level. The target's resistance is not used.
 -- A non-positive UnitLevel (classic skull targets often return -1) is not a level.
 -- Forever's docs do not define that sentinel, so the target section is omitted
--- rather than assuming player level + 3.
+-- rather than assuming defender level + 3.
 local function GetTargetContext()
     if not UnitExists then
         return nil
@@ -316,14 +334,21 @@ local function GetTargetContext()
 end
 
 local function RefreshResistanceCache()
-    local level = GetPlayerLevel()
-    if level then
-        cache.playerLevel = level
-    end
-    for _, schoolID in ipairs(SCHOOL_IDS) do
-        local resistance = GetPlayerResistance(schoolID)
-        if resistance ~= nil then
-            cache.resistance[schoolID] = resistance
+    for _, unit in ipairs({ "player", "pet" }) do
+        local level = GetUnitLevel(unit)
+        if level then
+            cache.level[unit] = level
+        end
+        local unitCache = cache.resistance[unit]
+        if not unitCache then
+            unitCache = {}
+            cache.resistance[unit] = unitCache
+        end
+        for _, schoolID in ipairs(SCHOOL_IDS) do
+            local resistance = GetUnitResistance(unit, schoolID)
+            if resistance ~= nil then
+                unitCache[schoolID] = resistance
+            end
         end
     end
 end
@@ -416,39 +441,51 @@ local function IsUnderFrame(frame, ancestor)
     return false
 end
 
--- Resistance rows live on CharacterStatsPaneScrollBox. The pet pane uses the
--- same icons and is a different frame, so it is left alone.
-local function IsPlayerResistanceRow(frame)
-    if not IsUnderFrame(frame, CharacterStatsPaneScrollBox) then
-        return false
+-- Player resists live on CharacterStatsPaneScrollBox.
+-- Pet resists live on CharacterStatsPanePetScrollBox (same icon rows).
+-- Prefer frame.unit when the paper-doll row already stamped it.
+local function ResolveTooltipUnit(frame)
+    if frame and UsableString(frame.unit) and (frame.unit == "player" or frame.unit == "pet") then
+        return frame.unit
     end
-    return SchoolFromFrame(frame) ~= nil
+    if IsUnderFrame(frame, CharacterStatsPanePetScrollBox) then
+        return "pet"
+    end
+    if IsUnderFrame(frame, CharacterStatsPaneScrollBox) then
+        return "player"
+    end
+    return nil
+end
+
+local function IsResistanceRow(frame)
+    return ResolveTooltipUnit(frame) ~= nil and SchoolFromFrame(frame) ~= nil
 end
 
 -- Native tooltip already shows floor(0.75 * resistance / (playerLevel * 5) * 100)
 -- via RESISTANCE_TOOLTIP_SUBTEXT. That is the same-level average, so it is not
 -- repeated here. Negative resistance has no verified partial-resist or
 -- vulnerability line in Forever; only spell miss is added.
-local function AppendResistanceTooltip(frame, schoolID)
-    if not schoolID or not GameTooltip:IsOwned(frame) then
+local function AppendResistanceTooltip(frame, schoolID, unit)
+    if not schoolID or not unit or not GameTooltip:IsOwned(frame) then
         return
     end
 
-    local playerLevel, levelIsStale = ResolvePlayerLevel()
-    if not playerLevel then
+    local defenderLevel, levelIsStale = ResolveUnitLevel(unit)
+    if not defenderLevel then
         return
     end
-    local resistance, resistanceIsStale = ResolveResistance(schoolID, frame)
+    local resistance, resistanceIsStale = ResolveResistance(unit, schoolID, frame)
     if resistance == nil then
         return
     end
 
-    local ownContext = BuildResistanceContext(resistance, playerLevel, playerLevel)
+    local defenderIsPlayer = unit == "player"
+    local ownContext = BuildResistanceContext(resistance, defenderLevel, defenderLevel, defenderIsPlayer)
     local targetContext
     local targetLabel
     local target = GetTargetContext()
-    if target and target.level ~= playerLevel then
-        targetContext = BuildResistanceContext(resistance, playerLevel, target.level)
+    if target and target.level ~= defenderLevel then
+        targetContext = BuildResistanceContext(resistance, defenderLevel, target.level, defenderIsPlayer)
         if target.name then
             targetLabel = target.name .. " · Level " .. target.level
         else
@@ -466,7 +503,7 @@ local function AppendResistanceTooltip(frame, schoolID)
     GameTooltip:AddLine(" ")
     GameTooltip:AddLine("Resist Forever", NORMAL_FONT_COLOR.r, NORMAL_FONT_COLOR.g, NORMAL_FONT_COLOR.b)
     if showOwn then
-        AddContext("Against level " .. playerLevel, ownContext)
+        AddContext("Against level " .. defenderLevel, ownContext)
     end
     if showTarget then
         if showOwn then
@@ -485,11 +522,11 @@ local function AppendResistanceTooltip(frame, schoolID)
 end
 
 local function AfterPaperDollStatTooltip(frame)
-    if appending or not IsPlayerResistanceRow(frame) then
+    if appending or not IsResistanceRow(frame) then
         return
     end
     appending = true
-    AppendResistanceTooltip(frame, SchoolFromFrame(frame))
+    AppendResistanceTooltip(frame, SchoolFromFrame(frame), ResolveTooltipUnit(frame))
     appending = false
 end
 
@@ -551,10 +588,11 @@ eventFrame:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
 eventFrame:RegisterEvent("PLAYER_LEVEL_UP")
 eventFrame:RegisterEvent("PLAYER_TARGET_CHANGED")
 eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+eventFrame:RegisterEvent("UNIT_PET")
 if eventFrame.RegisterUnitEvent then
-    eventFrame:RegisterUnitEvent("UNIT_AURA", "player")
-    eventFrame:RegisterUnitEvent("UNIT_RESISTANCES", "player")
-    eventFrame:RegisterUnitEvent("UNIT_LEVEL", "player")
+    eventFrame:RegisterUnitEvent("UNIT_AURA", "player", "pet")
+    eventFrame:RegisterUnitEvent("UNIT_RESISTANCES", "player", "pet")
+    eventFrame:RegisterUnitEvent("UNIT_LEVEL", "player", "pet")
 else
     eventFrame:RegisterEvent("UNIT_AURA")
     eventFrame:RegisterEvent("UNIT_RESISTANCES")
@@ -562,7 +600,8 @@ else
 end
 
 eventFrame:SetScript("OnEvent", function(_, event, unit)
-    if (event == "UNIT_AURA" or event == "UNIT_RESISTANCES" or event == "UNIT_LEVEL") and unit and unit ~= "player" then
+    if (event == "UNIT_AURA" or event == "UNIT_RESISTANCES" or event == "UNIT_LEVEL")
+        and unit and unit ~= "player" and unit ~= "pet" then
         return
     end
     InstallHooks()
