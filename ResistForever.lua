@@ -3,7 +3,9 @@
 -- Built for World of Warcraft: Forever 1.60.1 (Interface 16001).
 
 local PROBABILITY_EPSILON = 0.0005
-local PARTIAL_REDUCTIONS = { 25, 50, 75, 100 }
+-- Direct-spell partial resists land in 10% damage steps (Forever beta / wowsims).
+-- The 0% outcome is kept internally and never shown.
+local PARTIAL_REDUCTIONS = { 10, 20, 30, 40, 50, 60, 70, 80, 90, 100 }
 
 -- Enum.Damageclass on build 1.60.1.70009. FirstResist is 2, LastResist is 6.
 local SCHOOLS = {
@@ -30,25 +32,6 @@ for _, school in ipairs(SCHOOLS) do
     SCHOOL_BY_ATLAS[school.atlas] = id
     SCHOOL_IDS[#SCHOOL_IDS + 1] = id
 end
-
--- PaperDollFrameStats.lua CharacterHitFrame_OnEnter declares
--- spellMissChances = { 4, 5, 6, 17 } (PvE, levels 0-3 above the caster).
--- Blizzard's classic tables also split player targets (PvP) from mobs (PvE):
---   PvE +3 = 17%, then +11% per further level
---   PvP +3 = 13%, then +7% per further level
--- Index is how many levels the defender is above the caster.
-local SPELL_MISS_PVE = {
-    [0] = 0.04,
-    [1] = 0.05,
-    [2] = 0.06,
-    [3] = 0.17,
-}
-local SPELL_MISS_PVP = {
-    [0] = 0.04,
-    [1] = 0.05,
-    [2] = 0.06,
-    [3] = 0.13,
-}
 
 local cache = {
     level = {},
@@ -117,19 +100,24 @@ end
 -- Math. No unit API calls.
 --------------------------------------------------
 
--- Forever's own helper, PaperDollFrameStats.lua ExpectedSpellResistance:
---   0.75 * resistance / (casterLevel * 5)
--- That helper has no level-20 floor and no 75% cap.
+-- Observed Forever direct-spell average resistance (wowsims/forever combat-log model):
+--   average = R / (R + 9 * attackerLevel)
+-- Attacker Spell Piercing is unknown here, so R is the defender's positive
+-- readable resistance only. Do not treat the paper-doll ExpectedSpellResistance
+-- UI helper (historically 0.75 * R / (5L) on earlier Forever builds) as the
+-- server-side partial-resist model.
 local function ComputeAverageResistance(resistance, attackerLevel)
-    if not UsableNumber(resistance) or not attackerLevel or attackerLevel < 1 then
+    if not UsableNumber(resistance) or resistance <= 0 or not attackerLevel or attackerLevel < 1 then
         return nil
     end
-    return 0.75 * resistance / (attackerLevel * 5)
+    return resistance / (resistance + 9 * attackerLevel)
 end
 
--- Partial-resist distribution is not in the Forever UI.
--- This is the classic bell curve P(x) = 0.5 - 2.5*|x - average|,
--- sampled every 10% and folded into the 25% outcomes. Treat it as an estimate.
+-- Direct magical damage only. Non-channeled periodic ticks appear to use about
+-- one tenth of this average, and channels/binary spells differ; those are not
+-- shown because the addon is not spell-specific.
+-- Forever outcomes are 0/10/.../100% resisted. Edge averages use the closed
+-- 0-20% / 80-100% forms; the middle uses P(x) = max(0, 0.5 - 2.5*|x - a|).
 local function ComputePartialResistBuckets(resistance, attackerLevel)
     if not UsableNumber(resistance) or resistance <= 0 then
         return nil
@@ -138,82 +126,62 @@ local function ComputePartialResistBuckets(resistance, attackerLevel)
     if not average or average <= 0 then
         return nil
     end
-    -- The curve is only defined through a full resist. The client helper
-    -- itself does not clamp.
     if average > 1 then
         average = 1
     end
 
-    local weights = {}
-    local sum = 0
+    local buckets = {}
     for step = 0, 10 do
-        local outcome = step / 10
-        local weight = 0.5 - 2.5 * math.abs(outcome - average)
-        if weight < 0 then
-            weight = 0
-        end
-        weights[step] = weight
-        sum = sum + weight
+        buckets[step * 10] = 0
     end
 
-    local buckets = { [0] = 0, [25] = 0, [50] = 0, [75] = 0, [100] = 0 }
-    if sum <= 0 then
-        buckets[0] = 1
-        return buckets
-    end
-
-    for step = 0, 10 do
-        local outcome = step / 10
-        local chance = weights[step] / sum
-        if outcome < 0.125 then
-            buckets[0] = buckets[0] + chance
-        elseif outcome < 0.375 then
-            buckets[25] = buckets[25] + chance
-        elseif outcome < 0.625 then
-            buckets[50] = buckets[50] + chance
-        elseif outcome < 0.875 then
-            buckets[75] = buckets[75] + chance
-        else
-            buckets[100] = buckets[100] + chance
+    if average <= 0.10 then
+        buckets[0] = 1 - 7.5 * average
+        buckets[10] = 5 * average
+        buckets[20] = 2.5 * average
+    elseif average >= 0.90 then
+        local inv = 1 - average
+        buckets[100] = 1 - 7.5 * inv
+        buckets[90] = 5 * inv
+        buckets[80] = 2.5 * inv
+    else
+        for step = 0, 10 do
+            local outcome = step / 10
+            local weight = 0.5 - 2.5 * math.abs(outcome - average)
+            if weight < 0 then
+                weight = 0
+            end
+            buckets[step * 10] = weight
         end
     end
     return buckets
 end
 
--- Miss chance for a caster of attackerLevel against a defender of defenderLevel.
--- Player defenders use the PvP column; pets and other non-players use PvE.
--- Below the caster, classic tables fall 1% per level to 0% at -4 and lower.
--- Above +3, continuation is the classic +11% (PvE) / +7% (PvP) per level.
-local function ComputeSpellMiss(defenderLevel, attackerLevel, defenderIsPlayer)
+-- Base spell miss from level difference only (before attacker spell hit).
+-- Forever model: +3 or more levels above the caster -> 17%; otherwise
+-- max(0, 4% + levelDiff * 1%). There is no unavoidable 1% miss floor; a
+-- calculated 1% from a three-level caster advantage is still possible, and
+-- attacker spell hit (unknown here) can reduce any of these values to 0.
+-- No separate player-target (old Classic PvP 13%/+7%) table is applied; current
+-- Forever evidence does not confirm that split for this addon.
+local function ComputeSpellMiss(defenderLevel, attackerLevel)
     if not defenderLevel or not attackerLevel or defenderLevel < 1 or attackerLevel < 1 then
         return nil
     end
-    local levelsAboveCaster = defenderLevel - attackerLevel
-    local table = defenderIsPlayer and SPELL_MISS_PVP or SPELL_MISS_PVE
-    local verified = table[levelsAboveCaster]
-    if verified then
-        return verified
+    local levelDiff = defenderLevel - attackerLevel
+    if levelDiff >= 3 then
+        return 0.17
     end
-
-    local miss
-    if levelsAboveCaster > 3 then
-        local base = defenderIsPlayer and 0.13 or 0.17
-        local step = defenderIsPlayer and 0.07 or 0.11
-        miss = base + (levelsAboveCaster - 3) * step
-    else
-        miss = 0.04 + levelsAboveCaster * 0.01
-    end
+    local miss = 0.04 + levelDiff * 0.01
     if miss < 0 then
-        miss = 0
-    elseif miss > 1 then
-        miss = 1
+        return 0
     end
     return miss
 end
 
-local function BuildResistanceContext(resistance, defenderLevel, attackerLevel, defenderIsPlayer)
+local function BuildResistanceContext(resistance, defenderLevel, attackerLevel)
     local context = {
-        spellMiss = ComputeSpellMiss(defenderLevel, attackerLevel, defenderIsPlayer),
+        spellMiss = ComputeSpellMiss(defenderLevel, attackerLevel),
     }
     if UsableNumber(resistance) and resistance > 0 then
         context.buckets = ComputePartialResistBuckets(resistance, attackerLevel)
@@ -397,7 +365,7 @@ local function AddContext(label, context)
     if context.spellMiss and context.spellMiss >= PROBABILITY_EPSILON then
         local text = FormatPercent(context.spellMiss)
         if text ~= "0.0%" then
-            AddRow("Spell miss", text)
+            AddRow("Base spell miss", text)
         end
     end
 end
@@ -461,10 +429,11 @@ local function IsResistanceRow(frame)
     return ResolveTooltipUnit(frame) ~= nil and SchoolFromFrame(frame) ~= nil
 end
 
--- Native tooltip already shows floor(0.75 * resistance / (playerLevel * 5) * 100)
--- via RESISTANCE_TOOLTIP_SUBTEXT. That is the same-level average, so it is not
--- repeated here. Negative resistance has no verified partial-resist or
--- vulnerability line in Forever; only spell miss is added.
+-- Keep Blizzard's native resistance tooltip intact. Earlier Forever builds
+-- exposed an ExpectedSpellResistance / RESISTANCE_TOOLTIP_SUBTEXT average from
+-- the paper-doll UI; that line is not duplicated here, and it is not treated as
+-- the current server-side partial-resist model. Negative resistance has no
+-- verified partial-resist line; only base spell miss is added in that case.
 local function AppendResistanceTooltip(frame, schoolID, unit)
     if not schoolID or not unit or not GameTooltip:IsOwned(frame) then
         return
@@ -479,13 +448,12 @@ local function AppendResistanceTooltip(frame, schoolID, unit)
         return
     end
 
-    local defenderIsPlayer = unit == "player"
-    local ownContext = BuildResistanceContext(resistance, defenderLevel, defenderLevel, defenderIsPlayer)
+    local ownContext = BuildResistanceContext(resistance, defenderLevel, defenderLevel)
     local targetContext
     local targetLabel
     local target = GetTargetContext()
     if target and target.level ~= defenderLevel then
-        targetContext = BuildResistanceContext(resistance, defenderLevel, target.level, defenderIsPlayer)
+        targetContext = BuildResistanceContext(resistance, defenderLevel, target.level)
         if target.name then
             targetLabel = target.name .. " · Level " .. target.level
         else
